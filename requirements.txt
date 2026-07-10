@@ -1,0 +1,4 @@
+Pillow>=12.0,<13
+PyQt5>=5.15.11,<5.16
+keyboard>=0.13.5,<0.14
+PyDirectInput>=1.0.4,<2

@@ -1,5 +1,6 @@
 import ctypes
 import os
+import shutil
 import sys
 import threading
 import time
@@ -36,8 +37,39 @@ from hcb import ids, name_mapping
 from research_core import ConfigError, ResearchConfig, ResearchScanner, ScanResult
 
 
-BASE_DIR = Path(__file__).resolve().parent
-CONFIG_PATH = BASE_DIR / "gc.txt"
+BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else BUNDLE_DIR
+
+
+def prepare_runtime_assets() -> Path:
+    """把需要用户访问或编辑的内置文件释放到 EXE 同目录。"""
+    default_config = BUNDLE_DIR / "gc.txt"
+    config_path = APP_DIR / "gc.txt"
+    if not config_path.exists() and default_config.exists() and config_path != default_config:
+        try:
+            shutil.copy2(default_config, config_path)
+        except OSError:
+            fallback_dir = Path(os.environ.get("APPDATA", APP_DIR)) / "AutoThaumcraftResearch"
+            fallback_dir.mkdir(parents=True, exist_ok=True)
+            config_path = fallback_dir / "gc.txt"
+            if not config_path.exists():
+                shutil.copy2(default_config, config_path)
+
+    resource_pack_source = BUNDLE_DIR / "auto_thaumcraft_research.zip"
+    resource_pack_target = APP_DIR / "auto_thaumcraft_research.zip"
+    if (
+        resource_pack_source.exists()
+        and resource_pack_target != resource_pack_source
+        and not resource_pack_target.exists()
+    ):
+        try:
+            shutil.copy2(resource_pack_source, resource_pack_target)
+        except OSError:
+            pass
+    return config_path
+
+
+CONFIG_PATH = prepare_runtime_assets()
 
 
 def get_foreground_window() -> int:
@@ -373,7 +405,7 @@ class ControlPanel(QtWidgets.QWidget):
 class ConfigDialog(QtWidgets.QDialog):
     preview_requested = QtCore.pyqtSignal(object)
     config_saved = QtCore.pyqtSignal(object)
-    runtime_saved = QtCore.pyqtSignal(float, str, str)
+    runtime_saved = QtCore.pyqtSignal(str, str)
 
     HEADERS = ("起始 X", "起始 Y", "横向间距", "横向数量", "纵向间距", "纵向数量", "框大小")
     ROWS = ("研究点阵 1", "研究点阵 2", "左侧要素", "右侧要素")
@@ -382,7 +414,6 @@ class ConfigDialog(QtWidgets.QDialog):
         self,
         config: ResearchConfig,
         config_path: Path,
-        drag_duration: float,
         scan_hotkey: str,
         drag_hotkey: str,
     ):
@@ -401,16 +432,10 @@ class ConfigDialog(QtWidgets.QDialog):
                 self.table.setItem(row, column, QtWidgets.QTableWidgetItem(f"{value:g}"))
 
         explanation = QtWidgets.QLabel("预览会显示绿色框；保存后主程序会立即使用新坐标。")
-        self.drag_duration = QtWidgets.QDoubleSpinBox()
-        self.drag_duration.setRange(0.05, 1.50)
-        self.drag_duration.setSingleStep(0.05)
-        self.drag_duration.setSuffix(" 秒")
-        self.drag_duration.setValue(drag_duration)
         self.scan_hotkey = QtWidgets.QLineEdit(scan_hotkey)
         self.drag_hotkey = QtWidgets.QLineEdit(drag_hotkey)
 
         runtime_form = QtWidgets.QFormLayout()
-        runtime_form.addRow("单次拖动时长", self.drag_duration)
         runtime_form.addRow("扫描快捷键", self.scan_hotkey)
         runtime_form.addRow("连线快捷键", self.drag_hotkey)
         preview_button = QtWidgets.QPushButton("预览绿框")
@@ -463,7 +488,7 @@ class ConfigDialog(QtWidgets.QDialog):
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "保存失败", str(exc))
             return
-        self.runtime_saved.emit(self.drag_duration.value(), scan_hotkey, drag_hotkey)
+        self.runtime_saved.emit(scan_hotkey, drag_hotkey)
         self.config_saved.emit(config)
         self.accept()
 
@@ -498,14 +523,12 @@ class DragWorker(QtCore.QObject):
         result: ScanResult,
         stop_event: threading.Event,
         target_window: int,
-        drag_duration: float,
         screen_origin,
     ):
         super().__init__()
         self.result = result
         self.stop_event = stop_event
         self.target_window = target_window
-        self.drag_duration = drag_duration
         self.screen_origin = screen_origin
 
     def _must_stop(self) -> Optional[str]:
@@ -516,7 +539,7 @@ class DragWorker(QtCore.QObject):
             return "游戏窗口失去焦点，已自动停止"
         return None
 
-    def _move_cursor(self, x: int, y: int, _duration: float = 0.0) -> Optional[str]:
+    def _move_cursor(self, x: int, y: int) -> Optional[str]:
         """使用虚拟桌面坐标瞬移鼠标，保持旧版 pydirectinput 的速度。"""
         reason = self._must_stop()
         if reason:
@@ -560,7 +583,7 @@ class DragWorker(QtCore.QObject):
                     if reason:
                         self.finished.emit(True, reason)
                         return
-                    reason = self._move_cursor(target_x, target_y, self.drag_duration)
+                    reason = self._move_cursor(target_x, target_y)
                     if reason:
                         self.finished.emit(True, reason)
                         return
@@ -639,10 +662,6 @@ class ApplicationController(QtCore.QObject):
         self.last_external_window = get_foreground_window()
         self.scan_hotkey = str(self.panel.settings.value("scan_hotkey", "ctrl+8"))
         self.drag_hotkey = str(self.panel.settings.value("drag_hotkey", "ctrl+5"))
-        try:
-            self.drag_duration = float(self.panel.settings.value("drag_duration", 0.3))
-        except (TypeError, ValueError):
-            self.drag_duration = 0.3
         self.panel.set_hotkeys(self.scan_hotkey, self.drag_hotkey)
 
         self.panel.scan_requested.connect(self.scan)
@@ -886,7 +905,6 @@ class ApplicationController(QtCore.QObject):
             self.latest_result,
             self.stop_event,
             self.target_window,
-            self.drag_duration,
             (geometry.x(), geometry.y()),
         )
         self.drag_worker.moveToThread(self.drag_thread)
@@ -957,7 +975,6 @@ class ApplicationController(QtCore.QObject):
         self.config_dialog = ConfigDialog(
             config,
             CONFIG_PATH,
-            self.drag_duration,
             self.scan_hotkey,
             self.drag_hotkey,
         )
@@ -992,8 +1009,8 @@ class ApplicationController(QtCore.QObject):
         self.latest_result = None
         self._set_state(AppState.IDLE, "坐标已保存，请扫描研究")
 
-    @QtCore.pyqtSlot(float, str, str)
-    def _runtime_saved(self, drag_duration: float, scan_hotkey: str, drag_hotkey: str):
+    @QtCore.pyqtSlot(str, str)
+    def _runtime_saved(self, scan_hotkey: str, drag_hotkey: str):
         old_scan_hotkey = self.scan_hotkey
         old_drag_hotkey = self.drag_hotkey
         self.hotkeys.unregister()
@@ -1006,10 +1023,8 @@ class ApplicationController(QtCore.QObject):
             )
             return
 
-        self.drag_duration = drag_duration
         self.scan_hotkey = scan_hotkey
         self.drag_hotkey = drag_hotkey
-        self.panel.settings.setValue("drag_duration", drag_duration)
         self.panel.settings.setValue("scan_hotkey", scan_hotkey)
         self.panel.settings.setValue("drag_hotkey", drag_hotkey)
         self.panel.set_hotkeys(scan_hotkey, drag_hotkey)
