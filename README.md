@@ -9,9 +9,9 @@
 
 ## 效果展示
 
-![78368334206](C:\Users\28103\AppData\Local\Temp\1783683342062.png)
+![image](https://github.com/gsrrison/auto_thaumcraft_research_gui/image/20260710-194420.png)
 
-![78368336413](C:\Users\28103\AppData\Local\Temp\1783683364138.png)
+![image](https://github.com/gsrrison/auto_thaumcraft_research_gui/image/20260710-194459.png)
 
 ## 使用方法
 
