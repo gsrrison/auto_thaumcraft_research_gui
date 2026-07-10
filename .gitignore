@@ -1,0 +1,32 @@
+# Codex and local agent metadata
+.agents/
+.codex/
+
+# Python cache and environments
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Build output
+build/
+dist/
+*.egg-info/
+
+# IDE and OS metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Runtime diagnostics
+*.log
+runtime-test.*
+
+# Archived local code; history is kept in Git
+old/
