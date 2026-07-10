@@ -9,9 +9,9 @@
 
 ## 效果展示
 
-![image](https://github.com/gsrrison/auto_thaumcraft_research_gui/tree/main/image/20260710-194420.png)
+![扫描并生成研究连线方案](./image/20260710-194420.png)
 
-![image](https://github.com/gsrrison/auto_thaumcraft_research_gui/tree/main/image/20260710-194459.png)
+![自动连线完成效果](./image/20260710-194459.png)
 
 ## 使用方法
 
