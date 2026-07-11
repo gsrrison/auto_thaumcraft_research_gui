@@ -194,7 +194,12 @@ class ResearchScanner:
             )
 
         source_boxes, source_unknown = self._build_source_boxes(
-            image, panels, region, sample_size
+            image,
+            panels,
+            region,
+            sample_size,
+            large_components,
+            tile_size,
         )
         research_boxes, research_unknown = self._build_research_boxes(
             image,
@@ -542,6 +547,8 @@ class ResearchScanner:
         panels: Sequence[Tuple[List[int], List[int]]],
         region: WorkRegion,
         sample_size: int,
+        large_components: Sequence[_ColorComponent],
+        tile_size: int,
     ) -> Tuple[List[Box], Set[Tuple[int, int, int]]]:
         boxes: List[Box] = []
         unknown_colors: Set[Tuple[int, int, int]] = set()
@@ -549,9 +556,18 @@ class ResearchScanner:
             for y in y_centers:
                 for x in x_centers:
                     local_box = self._centered_box(x, y, sample_size)
-                    recognition = recognize(self._crop(image, local_box))
+                    component = self._matching_component(
+                        large_components, x, y, tile_size
+                    )
+                    recognition = self._recognize_with_context(
+                        image, x, y, sample_size, tile_size
+                    )
                     box = self._offset_box(local_box, region)
-                    box.label = recognition.class_id
+                    box.label = (
+                        component.class_id
+                        if component is not None and component.class_id > 0
+                        else recognition.class_id
+                    )
                     boxes.append(box)
                     if recognition.unknown and recognition.sampled_color is not None:
                         unknown_colors.add(recognition.sampled_color)
@@ -598,19 +614,191 @@ class ResearchScanner:
 
         centers = self._deduplicate_centers(candidates, max(5.0, tile_size * 0.16))
         centers = self._largest_hex_component(centers, tile_size)
+        centers = self._recover_textured_centers(
+            image,
+            centers,
+            tile_size,
+            sample_size,
+            central_left,
+            central_right,
+        )
+        centers = self._largest_hex_component(centers, tile_size)
         boxes: List[Box] = []
         unknown_colors: Set[Tuple[int, int, int]] = set()
         for center_x, center_y in sorted(centers, key=lambda point: (point[1], point[0])):
             local_box = self._centered_box(center_x, center_y, sample_size)
-            recognition = recognize(self._crop(image, local_box))
-            if recognition.class_id == 0:
+            component = self._matching_component(
+                large_components, center_x, center_y, tile_size
+            )
+            recognition = self._recognize_with_context(
+                image, center_x, center_y, sample_size, tile_size
+            )
+            class_id = (
+                component.class_id
+                if component is not None and component.class_id > 0
+                else recognition.class_id
+            )
+            if class_id == 0:
                 continue
             box = self._offset_box(local_box, region)
-            box.label = recognition.class_id
+            box.label = class_id
             boxes.append(box)
             if recognition.unknown and recognition.sampled_color is not None:
                 unknown_colors.add(recognition.sampled_color)
         return boxes, unknown_colors
+
+    def _recover_textured_centers(
+        self,
+        image: Image.Image,
+        centers: Sequence[Tuple[float, float]],
+        tile_size: int,
+        sample_size: int,
+        central_left: float,
+        central_right: float,
+    ) -> List[Tuple[float, float]]:
+        """从六角网格缺口中恢复没有形成纯色连通块的纹理固定元素。"""
+        result = list(centers)
+        vectors = self._infer_hex_vectors(result, tile_size)
+        if not vectors:
+            return result
+
+        minimum_separation = tile_size * 0.35
+        for _ in range(2):
+            proposals: List[Tuple[Tuple[float, float], int]] = []
+            for center_x, center_y in list(result):
+                for vector_x, vector_y in vectors:
+                    for direction in (-1, 1):
+                        candidate = (
+                            center_x + vector_x * direction,
+                            center_y + vector_y * direction,
+                        )
+                        x, y = candidate
+                        if not (
+                            central_left <= x <= central_right
+                            and sample_size <= y <= image.height - sample_size
+                        ):
+                            continue
+                        if any(
+                            math.dist(candidate, existing) < minimum_separation
+                            for existing in result
+                        ):
+                            continue
+                        recognition = self._recognize_with_context(
+                            image, x, y, sample_size, tile_size
+                        )
+                        if (
+                            recognition.class_id <= self.blank_id
+                            or recognition.color_distance != 0.0
+                            or recognition.sampled_color is None
+                            or max(recognition.sampled_color) <= 28
+                            or recognition.support < 0.10
+                        ):
+                            continue
+                        proposals.append((candidate, recognition.class_id))
+            recovered = self._merge_recovery_proposals(proposals, tile_size)
+            if not recovered:
+                break
+            result.extend(recovered)
+        return self._deduplicate_centers(
+            result, max(5.0, tile_size * 0.16)
+        )
+
+    @staticmethod
+    def _merge_recovery_proposals(
+        proposals: Sequence[Tuple[Tuple[float, float], int]], tile_size: int
+    ) -> List[Tuple[float, float]]:
+        groups: List[List[Tuple[Tuple[float, float], int]]] = []
+        for proposal in proposals:
+            point, class_id = proposal
+            matching_group = None
+            for group in groups:
+                group_class = group[0][1]
+                center = (
+                    statistics.mean(item[0][0] for item in group),
+                    statistics.mean(item[0][1] for item in group),
+                )
+                if group_class == class_id and math.dist(point, center) <= tile_size * 0.28:
+                    matching_group = group
+                    break
+            if matching_group is None:
+                groups.append([proposal])
+            else:
+                matching_group.append(proposal)
+        return [
+            (
+                statistics.mean(item[0][0] for item in group),
+                statistics.mean(item[0][1] for item in group),
+            )
+            for group in groups
+            if len(group) >= 2
+        ]
+
+    @staticmethod
+    def _infer_hex_vectors(
+        centers: Sequence[Tuple[float, float]], tile_size: int
+    ) -> List[Tuple[float, float]]:
+        vertical = []
+        diagonal = []
+        for left in range(len(centers)):
+            for right in range(left + 1, len(centers)):
+                delta_x = centers[right][0] - centers[left][0]
+                delta_y = centers[right][1] - centers[left][1]
+                distance = math.hypot(delta_x, delta_y)
+                if not tile_size * 0.78 <= distance <= tile_size * 1.18:
+                    continue
+                if abs(delta_x) <= tile_size * 0.25:
+                    vertical.append(abs(delta_y))
+                elif (
+                    tile_size * 0.60 <= abs(delta_x) <= tile_size * 1.08
+                    and tile_size * 0.25 <= abs(delta_y) <= tile_size * 0.72
+                ):
+                    diagonal.append((abs(delta_x), abs(delta_y)))
+        vectors: List[Tuple[float, float]] = []
+        if vertical:
+            vectors.append((0.0, statistics.median(vertical)))
+        if diagonal:
+            diagonal_x = statistics.median(value[0] for value in diagonal)
+            diagonal_y = statistics.median(value[1] for value in diagonal)
+            vectors.extend(((diagonal_x, diagonal_y), (diagonal_x, -diagonal_y)))
+        return vectors
+
+    @staticmethod
+    def _matching_component(
+        components: Sequence[_ColorComponent],
+        center_x: float,
+        center_y: float,
+        tile_size: int,
+    ) -> Optional[_ColorComponent]:
+        nearby = [
+            component
+            for component in components
+            if math.dist(component.center, (center_x, center_y)) <= tile_size * 0.18
+        ]
+        if not nearby:
+            return None
+        return min(
+            nearby,
+            key=lambda component: math.dist(component.center, (center_x, center_y)),
+        )
+
+    def _recognize_with_context(
+        self,
+        image: Image.Image,
+        center_x: float,
+        center_y: float,
+        sample_size: int,
+        tile_size: int,
+    ):
+        sample_box = self._centered_box(center_x, center_y, sample_size)
+        recognition = recognize(self._crop(image, sample_box))
+        if recognition.class_id > 0 and not recognition.unknown:
+            return recognition
+
+        # 纹理元素可能完全覆盖中央取样区；扩大范围后，四周仍保留其登记底色。
+        context_size = max(sample_size, round(tile_size * 0.76))
+        context_box = self._centered_box(center_x, center_y, context_size)
+        contextual = recognize(self._crop(image, context_box))
+        return contextual if contextual.class_id > 0 else recognition
 
     @staticmethod
     def _deduplicate_centers(

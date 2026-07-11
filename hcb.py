@@ -136,6 +136,7 @@ class Recognition:
     sampled_color: Optional[Tuple[int, int, int]] = None
     color_distance: Optional[float] = None
     unknown: bool = False
+    support: float = 0.0
 
 
 def recognize(crop, color_tolerance=12):
@@ -163,9 +164,42 @@ def recognize(crop, color_tolerance=12):
     if not color_counter:
         return Recognition(0)
 
+    # 纹理图标的中心主色不一定是元素底色。只要裁剪范围内仍有足够的已知
+    # 底色像素，就按整个区域投票，避免 gula 等非纯色元素被图标纹理盖住。
+    class_votes = Counter()
+    representative_colors = {}
+    for color, count in color_counter.items():
+        aspect_name = ys.get(color)
+        class_id = getids.get(aspect_name, 0)
+        if class_id <= 0:
+            continue
+        class_votes[class_id] += count
+        if count > representative_colors.get(class_id, (0, None))[0]:
+            representative_colors[class_id] = (count, color)
+    if class_votes:
+        ranked_votes = class_votes.most_common(2)
+        best_class, best_count = ranked_votes[0]
+        second_count = ranked_votes[1][1] if len(ranked_votes) > 1 else 0
+        minimum_votes = max(3, round(sum(color_counter.values()) * 0.015))
+        if best_count >= minimum_votes and (
+            second_count == 0 or best_count >= second_count * 1.25
+        ):
+            known_color = representative_colors[best_class][1]
+            return Recognition(
+                best_class,
+                known_color,
+                0.0,
+                support=best_count / max(1, crop.width * crop.height),
+            )
+
     sampled_color, _ = color_counter.most_common(1)[0]
     if sampled_color in ys:
-        return Recognition(getids.get(ys[sampled_color], 0), sampled_color, 0.0)
+        return Recognition(
+            getids.get(ys[sampled_color], 0),
+            sampled_color,
+            0.0,
+            support=color_counter[sampled_color] / max(1, crop.width * crop.height),
+        )
 
     known_distances = sorted(
         (
@@ -177,9 +211,20 @@ def recognize(crop, color_tolerance=12):
     distance, nearest_color = known_distances[0]
     second_distance = known_distances[1][0] if len(known_distances) > 1 else float("inf")
     if distance <= color_tolerance and second_distance - distance >= 4:
-        return Recognition(getids.get(ys[nearest_color], 0), sampled_color, distance)
+        return Recognition(
+            getids.get(ys[nearest_color], 0),
+            sampled_color,
+            distance,
+            support=color_counter[sampled_color] / max(1, crop.width * crop.height),
+        )
 
-    return Recognition(0, sampled_color, distance, unknown=True)
+    return Recognition(
+        0,
+        sampled_color,
+        distance,
+        unknown=True,
+        support=color_counter[sampled_color] / max(1, crop.width * crop.height),
+    )
 
 
 def see(crop):
