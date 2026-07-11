@@ -42,6 +42,7 @@ from research_core import (
 )
 
 
+APP_VERSION = "1.1.0"
 BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else BUNDLE_DIR
 
@@ -332,7 +333,7 @@ class ControlPanel(QtWidgets.QWidget):
         self._drag_offset = None
         self.settings = QtCore.QSettings("AutoThaumcraftResearch", "ControlPanel")
 
-        title = QtWidgets.QLabel("神秘时代自动研究")
+        title = QtWidgets.QLabel(f"神秘时代自动研究 v{APP_VERSION}")
         title.setObjectName("title")
         title.installEventFilter(self)
         close_button = QtWidgets.QPushButton("×")
@@ -474,7 +475,7 @@ class ConfigDialog(QtWidgets.QDialog):
         super().__init__(None)
         self.region_path = region_path
         self.screen_size = screen_size
-        self.setWindowTitle("坐标设置与自动标定")
+        self.setWindowTitle(f"坐标设置与自动标定 · v{APP_VERSION}")
         self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
         self.resize(560, 310)
 

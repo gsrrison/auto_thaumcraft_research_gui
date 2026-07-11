@@ -13,7 +13,7 @@
 ## 使用方法
 
 1. 将 `auto_thaumcraft_research.zip` 放入 Minecraft 的 `resourcepacks` 文件夹并启用。
-2. 双击 `AutoThaumcraftResearch.exe` 启动程序。
+2. 双击 Release 中的 `AutoThaumcraftResearch-v1.1.0.exe` 启动程序。
 3. 多屏环境下先点击“选择屏幕”，选择 Minecraft 所在屏幕。
 4. 打开研究界面，进入“坐标设置”。
 5. 点击“拖动红框选择工作区域”，让红框覆盖完整研究盘和左右元素列表，松开鼠标确认。
@@ -52,7 +52,7 @@ python -m pip install -r requirements.txt
 python main.py
 ```
 
-运行 `build_exe.bat` 可使用 PyInstaller 生成 `dist/AutoThaumcraftResearch.exe`。
+运行 `build_exe.bat` 可使用 PyInstaller 生成 `dist/AutoThaumcraftResearch-v1.1.0.exe`。
 
 ## 许可与致谢
 
