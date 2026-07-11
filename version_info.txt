@@ -1,7 +1,7 @@
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 1, 1, 0),
-    prodvers=(1, 1, 1, 0),
+    filevers=(1, 1, 2, 0),
+    prodvers=(1, 1, 2, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -16,12 +16,12 @@ VSVersionInfo(
         [
           StringStruct('CompanyName', 'gsrrison'),
           StringStruct('FileDescription', 'Auto Thaumcraft Research GUI'),
-          StringStruct('FileVersion', '1.1.1'),
+          StringStruct('FileVersion', '1.1.2'),
           StringStruct('InternalName', 'AutoThaumcraftResearch'),
           StringStruct('LegalCopyright', 'MIT License'),
-          StringStruct('OriginalFilename', 'AutoThaumcraftResearch-v1.1.1.exe'),
+          StringStruct('OriginalFilename', 'AutoThaumcraftResearch-v1.1.2.exe'),
           StringStruct('ProductName', 'Auto Thaumcraft Research GUI'),
-          StringStruct('ProductVersion', '1.1.1')
+          StringStruct('ProductVersion', '1.1.2')
         ]
       )
     ]),

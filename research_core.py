@@ -5,13 +5,14 @@ import itertools
 import json
 import math
 import statistics
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from PIL import Image, ImageGrab
 
-from hcb import Box, cont, getids, ids, memo, name_mapping, recognize, ys
+from hcb import Box, PRIMAL, cont, getids, ids, memo, name_mapping, recognize, ys
 
 
 class ConfigError(ValueError):
@@ -144,9 +145,14 @@ class ScanResult:
 class ResearchScanner:
     """从截图自动定位研究盘和可用元素，并计算连接方案。"""
 
+    PRIMAL_BALANCE_WEIGHT = 0.35
+
     def __init__(self, max_path_length: int = 40):
         self.max_path_length = max_path_length
         self.blank_id = getids.get("lj", 1)
+        self.primal_ids = tuple(
+            sorted(getids[name] for name in PRIMAL if name in getids)
+        )
 
     def capture_and_calibrate(
         self,
@@ -987,10 +993,17 @@ class ResearchScanner:
         connected: Set[int] = {first_node}
         remaining = set(fixed_nodes) - {first_node}
         connections: List[Tuple[List[int], List[int]]] = []
+        primal_usage = Counter({aspect_id: 0 for aspect_id in self.primal_ids})
         while remaining:
             candidates = []
             for target in sorted(remaining):
-                connection = self._find_next_connection(connected, target, current_labels, adjacency)
+                connection = self._find_next_connection(
+                    connected,
+                    target,
+                    current_labels,
+                    adjacency,
+                    primal_usage,
+                )
                 if connection is None:
                     continue
                 cost, grid_path, aspect_path = connection
@@ -1010,6 +1023,8 @@ class ResearchScanner:
             for node_id, aspect_id in zip(grid_path, aspect_path):
                 if current_labels[node_id] == self.blank_id:
                     current_labels[node_id] = aspect_id
+                    if aspect_id in primal_usage:
+                        primal_usage[aspect_id] += 1
                 connected.add(node_id)
             remaining.remove(target)
         return connections
@@ -1020,6 +1035,7 @@ class ResearchScanner:
         target: int,
         current_labels: Dict[int, int],
         adjacency: Sequence[Set[int]],
+        primal_usage: Counter,
     ) -> Optional[Tuple[float, List[int], List[int]]]:
         serial = itertools.count()
         queue = []
@@ -1047,7 +1063,10 @@ class ResearchScanner:
                     material_cost = memo.get(next_aspect, math.inf)
                     if math.isinf(material_cost):
                         continue
-                    next_cost = cost + material_cost
+                    balance_penalty = self._primal_balance_penalty(
+                        next_aspect, primal_usage, aspect_path
+                    )
+                    next_cost = cost + material_cost + balance_penalty
                     next_steps = steps + 1
                     state = (neighbor, next_aspect)
                     metric = (next_cost, next_steps)
@@ -1067,6 +1086,26 @@ class ResearchScanner:
                         ),
                     )
         return None
+
+    def _primal_balance_penalty(
+        self,
+        next_aspect: int,
+        primal_usage: Counter,
+        aspect_path: Sequence[int],
+    ) -> float:
+        """轻度惩罚重复使用同一种基础元素，但不改变必须经过的路径。"""
+        if next_aspect not in self.primal_ids:
+            return 0.0
+        path_usage = Counter(
+            aspect_id for aspect_id in aspect_path[1:] if aspect_id in self.primal_ids
+        )
+        projected_usage = {
+            aspect_id: primal_usage[aspect_id] + path_usage[aspect_id]
+            for aspect_id in self.primal_ids
+        }
+        least_used = min(projected_usage.values(), default=0)
+        imbalance = max(0, projected_usage[next_aspect] - least_used)
+        return imbalance * self.PRIMAL_BALANCE_WEIGHT
 
     @staticmethod
     def _aspect_name(aspect_id: int) -> str:

@@ -1,7 +1,7 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-set "APP_VERSION=1.1.1"
+set "APP_VERSION=1.1.2"
 
 py -3.14 -m PyInstaller ^
   --noconfirm ^
