@@ -11,7 +11,6 @@ py -3.14 -m PyInstaller ^
   --specpath build ^
   --workpath build\work ^
   --distpath dist ^
-  --add-data "%CD%\gc.txt;." ^
   --add-data "%CD%\class.txt;." ^
   --add-data "%CD%\ys.txt;." ^
   --add-data "%CD%\auto_thaumcraft_research.zip;." ^

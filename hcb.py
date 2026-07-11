@@ -141,7 +141,8 @@ class Recognition:
 def recognize(crop, color_tolerance=12):
     """按要素图标主色识别，并允许轻微的颜色误差。"""
     resampling = getattr(Image, "Resampling", Image)
-    crop = crop.resize((24, 24), resampling.LANCZOS).convert("RGB")
+    resize_filter = resampling.NEAREST if min(crop.size) < 24 else resampling.LANCZOS
+    crop = crop.resize((24, 24), resize_filter).convert("RGB")
     pixels = crop.load()
 
     color_counter = Counter()

@@ -33,8 +33,13 @@ import keyboard
 import pydirectinput
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from hcb import ids, name_mapping
-from research_core import ConfigError, ResearchConfig, ResearchScanner, ScanResult
+from research_core import (
+    ConfigError,
+    DetectedLayout,
+    ResearchScanner,
+    ScanResult,
+    WorkRegion,
+)
 
 
 BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
@@ -42,34 +47,21 @@ APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
 
 
 def prepare_runtime_assets() -> Path:
-    """把需要用户访问或编辑的内置文件释放到 EXE 同目录。"""
-    default_config = BUNDLE_DIR / "gc.txt"
-    config_path = APP_DIR / "gc.txt"
-    if not config_path.exists() and default_config.exists() and config_path != default_config:
-        try:
-            shutil.copy2(default_config, config_path)
-        except OSError:
-            fallback_dir = Path(os.environ.get("APPDATA", APP_DIR)) / "AutoThaumcraftResearch"
-            fallback_dir.mkdir(parents=True, exist_ok=True)
-            config_path = fallback_dir / "gc.txt"
-            if not config_path.exists():
-                shutil.copy2(default_config, config_path)
-
-    resource_pack_source = BUNDLE_DIR / "auto_thaumcraft_research.zip"
-    resource_pack_target = APP_DIR / "auto_thaumcraft_research.zip"
-    if (
-        resource_pack_source.exists()
-        and resource_pack_target != resource_pack_source
-        and not resource_pack_target.exists()
-    ):
-        try:
-            shutil.copy2(resource_pack_source, resource_pack_target)
-        except OSError:
-            pass
-    return config_path
+    """把用户需要访问的内置文件释放到 EXE 同目录。"""
+    runtime_dir = APP_DIR
+    for file_name in ("auto_thaumcraft_research.zip",):
+        source = BUNDLE_DIR / file_name
+        target = runtime_dir / file_name
+        if source.exists() and source != target and not target.exists():
+            try:
+                shutil.copy2(source, target)
+            except OSError:
+                pass
+    return runtime_dir
 
 
-CONFIG_PATH = prepare_runtime_assets()
+RUNTIME_DIR = prepare_runtime_assets()
+REGION_PATH = RUNTIME_DIR / "calibration.json"
 
 
 def get_foreground_window() -> int:
@@ -99,7 +91,7 @@ def safe_mouse_up():
 
 
 def apply_no_activate_style(widget: QtWidgets.QWidget):
-    """让悬浮控制窗可点击但不抢走 Minecraft 的前台焦点。"""
+    """让控制窗口可点击但不抢走 Minecraft 的前台焦点。"""
     if sys.platform != "win32":
         return
     try:
@@ -139,9 +131,9 @@ class OverlayWindow(QtWidgets.QWidget):
         show_without_activation = getattr(QtCore.Qt, "WA_ShowWithoutActivating", None)
         if show_without_activation is not None:
             self.setAttribute(show_without_activation)
-
         self.result: Optional[ScanResult] = None
         self.calibration_boxes = []
+        self.work_region: Optional[WorkRegion] = None
         self.selected_screen = QtGui.QGuiApplication.primaryScreen()
         self._refresh_geometry()
         apply_no_activate_style(self)
@@ -161,15 +153,16 @@ class OverlayWindow(QtWidgets.QWidget):
 
     def show_result(self, result: ScanResult):
         self.calibration_boxes = []
+        self.work_region = None
         self.result = result
         self._refresh_geometry()
         self.update()
         self.show()
 
-    def show_calibration(self, config: ResearchConfig):
-        research_boxes, source_boxes = config.create_boxes()
+    def show_calibration(self, layout: DetectedLayout, region: WorkRegion):
         self.result = None
-        self.calibration_boxes = research_boxes + source_boxes
+        self.calibration_boxes = layout.research_boxes + layout.source_boxes
+        self.work_region = region
         self._refresh_geometry()
         self.update()
         self.show()
@@ -177,6 +170,7 @@ class OverlayWindow(QtWidgets.QWidget):
     def clear_overlay(self):
         self.result = None
         self.calibration_boxes = []
+        self.work_region = None
         self.update()
         self.hide()
 
@@ -187,12 +181,18 @@ class OverlayWindow(QtWidgets.QWidget):
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
-
         if self.calibration_boxes:
-            pen = QtGui.QPen(QtGui.QColor(0, 255, 80), 2)
-            painter.setPen(pen)
+            painter.setPen(QtGui.QPen(QtGui.QColor(0, 255, 80), 2))
             for box in self.calibration_boxes:
                 painter.drawRect(box.rect)
+            if self.work_region is not None:
+                painter.setPen(QtGui.QPen(QtGui.QColor(255, 55, 55), 2, QtCore.Qt.DashLine))
+                painter.drawRect(
+                    self.work_region.x,
+                    self.work_region.y,
+                    self.work_region.width - 1,
+                    self.work_region.height - 1,
+                )
             painter.end()
             return
 
@@ -208,12 +208,103 @@ class OverlayWindow(QtWidgets.QWidget):
                     current = self.result.node_boxes[node_id]
                     painter.drawLine(previous.center, current.center)
                     previous = current
-
             for box in self.result.research_boxes:
                 box.draw(painter)
             for box in self.result.source_boxes:
                 box.draw(painter)
+        painter.end()
 
+
+class RegionSelector(QtWidgets.QWidget):
+    selected = QtCore.pyqtSignal(object)
+    cancelled = QtCore.pyqtSignal()
+
+    def __init__(self, screen, initial_region: WorkRegion):
+        super().__init__(None)
+        self.setWindowFlags(
+            QtCore.Qt.FramelessWindowHint
+            | QtCore.Qt.WindowStaysOnTopHint
+            | QtCore.Qt.Tool
+        )
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
+        self.setMouseTracking(True)
+        self.setCursor(QtCore.Qt.CrossCursor)
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
+        self.screen = screen
+        self.setGeometry(screen.geometry())
+        self.start_point: Optional[QtCore.QPoint] = None
+        self.current_rect = QtCore.QRect(
+            initial_region.x,
+            initial_region.y,
+            initial_region.width,
+            initial_region.height,
+        )
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.activateWindow()
+        self.raise_()
+        self.setFocus(QtCore.Qt.ActiveWindowFocusReason)
+
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.RightButton:
+            self.cancelled.emit()
+            return
+        if event.button() == QtCore.Qt.LeftButton:
+            self.start_point = event.pos()
+            self.current_rect = QtCore.QRect(self.start_point, self.start_point)
+            self.update()
+
+    def mouseMoveEvent(self, event):
+        if self.start_point is not None and event.buttons() & QtCore.Qt.LeftButton:
+            self.current_rect = QtCore.QRect(self.start_point, event.pos()).normalized()
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() != QtCore.Qt.LeftButton or self.start_point is None:
+            return
+        self.current_rect = QtCore.QRect(self.start_point, event.pos()).normalized()
+        self.start_point = None
+        if self.current_rect.width() < 240 or self.current_rect.height() < 180:
+            self.update()
+            return
+        region = WorkRegion(
+            self.current_rect.x(),
+            self.current_rect.y(),
+            self.current_rect.width(),
+            self.current_rect.height(),
+        )
+        self.selected.emit(region)
+
+    def keyPressEvent(self, event):
+        if event.key() == QtCore.Qt.Key_Escape:
+            self.cancelled.emit()
+            return
+        super().keyPressEvent(event)
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.fillRect(self.rect(), QtGui.QColor(0, 0, 0, 105))
+        painter.setPen(QtGui.QPen(QtGui.QColor(255, 55, 55), 3))
+        painter.setBrush(QtGui.QColor(255, 55, 55, 25))
+        painter.drawRect(self.current_rect)
+        painter.setPen(QtGui.QColor(255, 255, 255))
+        font = painter.font()
+        font.setPointSize(13)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(
+            QtCore.QRect(0, 18, self.width(), 60),
+            QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop,
+            "按住鼠标左键拖动红框，覆盖完整研究盘和左右元素列表\n松开即确认；Esc 或右键取消",
+        )
+        if self.current_rect.width() < 240 or self.current_rect.height() < 180:
+            painter.setPen(QtGui.QColor(255, 210, 80))
+            painter.drawText(
+                QtCore.QRect(0, self.height() - 55, self.width(), 35),
+                QtCore.Qt.AlignCenter,
+                "选择范围过小，请重新拖动",
+            )
         painter.end()
 
 
@@ -248,7 +339,6 @@ class ControlPanel(QtWidgets.QWidget):
         close_button.setObjectName("closeButton")
         close_button.setFixedSize(28, 28)
         close_button.clicked.connect(self.close)
-
         title_layout = QtWidgets.QHBoxLayout()
         title_layout.setContentsMargins(0, 0, 0, 0)
         title_layout.addWidget(title)
@@ -258,7 +348,6 @@ class ControlPanel(QtWidgets.QWidget):
         self.status_label.setObjectName("status")
         self.status_label.setWordWrap(True)
         self.status_label.setMinimumHeight(42)
-
         self.scan_button = QtWidgets.QPushButton("扫描研究  Ctrl + 8")
         self.drag_button = QtWidgets.QPushButton("开始连线  Ctrl + 5")
         self.config_button = QtWidgets.QPushButton("坐标设置")
@@ -272,10 +361,8 @@ class ControlPanel(QtWidgets.QWidget):
         self.progress.setRange(0, 1)
         self.progress.setValue(0)
         self.progress.setTextVisible(False)
-
         hint = QtWidgets.QLabel("Esc：紧急停止")
         hint.setObjectName("hint")
-
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(14, 10, 14, 12)
         layout.setSpacing(9)
@@ -287,47 +374,22 @@ class ControlPanel(QtWidgets.QWidget):
         layout.addWidget(self.config_button)
         layout.addWidget(self.screen_button)
         layout.addWidget(hint)
-
         self.setStyleSheet(
             """
-            QWidget#controlPanel {
-                background: rgba(24, 28, 35, 238);
-                border: 1px solid #596273;
-                border-radius: 9px;
-                color: #edf2f7;
-            }
-            QLabel#title {
-                color: #ffffff;
-                font-family: "Microsoft YaHei UI", "Microsoft YaHei";
-                font-size: 15px;
-                font-weight: 700;
-                padding: 3px;
-            }
-            QLabel#status {
-                background: rgba(8, 12, 18, 150);
-                border-radius: 5px;
-                padding: 8px;
-                color: #cde6ff;
-            }
+            QWidget#controlPanel { background: rgba(24,28,35,238); border: 1px solid #596273;
+                border-radius: 9px; color: #edf2f7; }
+            QLabel#title { color: #ffffff; font-family: "Microsoft YaHei UI"; font-size: 15px;
+                font-weight: 700; padding: 3px; }
+            QLabel#status { background: rgba(8,12,18,150); border-radius: 5px; padding: 8px;
+                color: #cde6ff; }
             QLabel#hint { color: #aeb8c8; font-size: 12px; }
-            QPushButton {
-                min-height: 34px;
-                background: #34445b;
-                border: 1px solid #58708f;
-                border-radius: 5px;
-                color: white;
-                font-size: 13px;
-            }
+            QPushButton { min-height: 34px; background: #34445b; border: 1px solid #58708f;
+                border-radius: 5px; color: white; font-size: 13px; }
             QPushButton:hover { background: #405775; }
             QPushButton:pressed { background: #29394e; }
             QPushButton:disabled { color: #6f7885; background: #262c35; border-color: #363d48; }
-            QPushButton#closeButton {
-                min-height: 0px;
-                background: transparent;
-                border: none;
-                font-size: 20px;
-                color: #c8d0dc;
-            }
+            QPushButton#closeButton { min-height: 0; background: transparent; border: none;
+                font-size: 20px; color: #c8d0dc; }
             QPushButton#closeButton:hover { background: #75404a; }
             QProgressBar { height: 5px; border: none; background: #202631; border-radius: 2px; }
             QProgressBar::chunk { background: #4fa3e3; border-radius: 2px; }
@@ -366,7 +428,7 @@ class ControlPanel(QtWidgets.QWidget):
         self.config_button.setEnabled(not busy)
         self.screen_button.setEnabled(not busy)
         self.drag_button.setEnabled(state == AppState.READY and can_drag)
-        if state in {AppState.SCANNING, AppState.DRAGGING, AppState.STOPPING}:
+        if busy:
             self.progress.setRange(0, 0)
         elif self.progress.maximum() == 0:
             self.progress.setRange(0, 1)
@@ -403,79 +465,116 @@ class ControlPanel(QtWidgets.QWidget):
 
 
 class ConfigDialog(QtWidgets.QDialog):
-    preview_requested = QtCore.pyqtSignal(object)
+    select_region_requested = QtCore.pyqtSignal()
+    calibrate_requested = QtCore.pyqtSignal(object)
     config_saved = QtCore.pyqtSignal(object)
     runtime_saved = QtCore.pyqtSignal(str, str)
 
-    HEADERS = ("起始 X", "起始 Y", "横向间距", "横向数量", "纵向间距", "纵向数量", "框大小")
-    ROWS = ("研究点阵 1", "研究点阵 2", "左侧要素", "右侧要素")
-
-    def __init__(
-        self,
-        config: ResearchConfig,
-        config_path: Path,
-        scan_hotkey: str,
-        drag_hotkey: str,
-    ):
+    def __init__(self, region: WorkRegion, region_path: Path, screen_size, scan_hotkey, drag_hotkey):
         super().__init__(None)
-        self.config_path = config_path
-        self.setWindowTitle("坐标设置")
+        self.region_path = region_path
+        self.screen_size = screen_size
+        self.setWindowTitle("坐标设置与自动标定")
         self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
-        self.resize(810, 360)
+        self.resize(560, 310)
 
-        self.table = QtWidgets.QTableWidget(4, 7)
-        self.table.setHorizontalHeaderLabels(self.HEADERS)
-        self.table.setVerticalHeaderLabels(self.ROWS)
-        self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
-        for row, grid in enumerate(config.grids):
-            for column, value in enumerate(grid.as_values()):
-                self.table.setItem(row, column, QtWidgets.QTableWidgetItem(f"{value:g}"))
+        self.x_spin = QtWidgets.QSpinBox()
+        self.y_spin = QtWidgets.QSpinBox()
+        self.width_spin = QtWidgets.QSpinBox()
+        self.height_spin = QtWidgets.QSpinBox()
+        self.x_spin.setRange(0, max(0, screen_size[0] - 1))
+        self.y_spin.setRange(0, max(0, screen_size[1] - 1))
+        self.width_spin.setRange(240, screen_size[0])
+        self.height_spin.setRange(180, screen_size[1])
 
-        explanation = QtWidgets.QLabel("预览会显示绿色框；保存后主程序会立即使用新坐标。")
+        region_form = QtWidgets.QFormLayout()
+        region_form.addRow("区域 X", self.x_spin)
+        region_form.addRow("区域 Y", self.y_spin)
+        region_form.addRow("区域宽度", self.width_spin)
+        region_form.addRow("区域高度", self.height_spin)
         self.scan_hotkey = QtWidgets.QLineEdit(scan_hotkey)
         self.drag_hotkey = QtWidgets.QLineEdit(drag_hotkey)
-
         runtime_form = QtWidgets.QFormLayout()
         runtime_form.addRow("扫描快捷键", self.scan_hotkey)
         runtime_form.addRow("连线快捷键", self.drag_hotkey)
-        preview_button = QtWidgets.QPushButton("预览绿框")
+
+        explanation = QtWidgets.QLabel(
+            "先拖动红框覆盖完整研究界面，再自动标定。绿色方框是本次从图像中识别出的研究格和元素位置；每次扫描都会重新识别。"
+        )
+        explanation.setWordWrap(True)
+        self.status_label = QtWidgets.QLabel("尚未执行自动标定")
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet("color: #2d6b45; padding: 4px;")
+        self.set_region(region)
+        self.select_button = QtWidgets.QPushButton("拖动红框选择工作区域")
+        self.calibrate_button = QtWidgets.QPushButton("自动标定并预览绿框")
         save_button = QtWidgets.QPushButton("保存并关闭")
         cancel_button = QtWidgets.QPushButton("取消")
-        preview_button.clicked.connect(self._preview)
+        self.select_button.clicked.connect(self.select_region_requested)
+        self.calibrate_button.clicked.connect(self._calibrate)
         save_button.clicked.connect(self._save)
         cancel_button.clicked.connect(self.reject)
 
-        button_layout = QtWidgets.QHBoxLayout()
-        button_layout.addStretch(1)
-        button_layout.addWidget(preview_button)
-        button_layout.addWidget(save_button)
-        button_layout.addWidget(cancel_button)
-
+        columns = QtWidgets.QHBoxLayout()
+        columns.addLayout(region_form)
+        columns.addSpacing(24)
+        columns.addLayout(runtime_form)
+        buttons = QtWidgets.QHBoxLayout()
+        buttons.addWidget(self.select_button)
+        buttons.addWidget(self.calibrate_button)
+        buttons.addStretch(1)
+        buttons.addWidget(save_button)
+        buttons.addWidget(cancel_button)
         layout = QtWidgets.QVBoxLayout(self)
         layout.addWidget(explanation)
-        layout.addWidget(self.table)
-        layout.addLayout(runtime_form)
-        layout.addLayout(button_layout)
+        layout.addLayout(columns)
+        layout.addWidget(self.status_label)
+        layout.addLayout(buttons)
 
-    def _build_config(self) -> ResearchConfig:
-        lines = []
-        for row in range(self.table.rowCount()):
-            values = []
-            for column in range(self.table.columnCount()):
-                item = self.table.item(row, column)
-                values.append(item.text().strip() if item is not None else "")
-            lines.append(",".join(values))
-        return ResearchConfig.from_text("\n".join(lines))
+    def set_region(self, region: WorkRegion):
+        self.x_spin.setValue(region.x)
+        self.y_spin.setValue(region.y)
+        self.width_spin.setValue(region.width)
+        self.height_spin.setValue(region.height)
+        self.status_label.setText("工作区域已更新，请点击自动标定检查绿框")
 
-    def _preview(self):
+    def build_region(self) -> WorkRegion:
+        return WorkRegion(
+            self.x_spin.value(),
+            self.y_spin.value(),
+            self.width_spin.value(),
+            self.height_spin.value(),
+        ).clamped(self.screen_size)
+
+    def set_busy(self, busy: bool, text: Optional[str] = None):
+        self.select_button.setEnabled(not busy)
+        self.calibrate_button.setEnabled(not busy)
+        if text:
+            self.status_label.setText(text)
+
+    def show_calibration_status(self, layout: DetectedLayout):
+        self.set_busy(False)
+        known_sources = sum(box.label is not None and box.label > 1 for box in layout.source_boxes)
+        self.status_label.setText(
+            f"标定成功：界面格 {layout.tile_size}px，研究格 {len(layout.research_boxes)} 个，"
+            f"原料位置 {len(layout.source_boxes)} 个（已知 {known_sources} 个）。"
+            + (" " + "；".join(layout.warnings) if layout.warnings else "")
+        )
+
+    def show_calibration_error(self, message: str):
+        self.set_busy(False, f"标定失败：{message}")
+
+    def _calibrate(self):
         try:
-            self.preview_requested.emit(self._build_config())
+            region = self.build_region()
         except ConfigError as exc:
-            QtWidgets.QMessageBox.warning(self, "坐标错误", str(exc))
+            QtWidgets.QMessageBox.warning(self, "区域错误", str(exc))
+            return
+        self.calibrate_requested.emit(region)
 
     def _save(self):
         try:
-            config = self._build_config()
+            region = self.build_region()
             scan_hotkey = self.scan_hotkey.text().strip().lower()
             drag_hotkey = self.drag_hotkey.text().strip().lower()
             if not scan_hotkey or not drag_hotkey:
@@ -484,12 +583,12 @@ class ConfigDialog(QtWidgets.QDialog):
                 raise ConfigError("两个功能快捷键必须不同，且不能占用 Esc")
             keyboard.parse_hotkey(scan_hotkey)
             keyboard.parse_hotkey(drag_hotkey)
-            config.save(self.config_path)
+            region.save(self.region_path)
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "保存失败", str(exc))
             return
         self.runtime_saved.emit(scan_hotkey, drag_hotkey)
-        self.config_saved.emit(config)
+        self.config_saved.emit(region)
         self.accept()
 
 
@@ -497,15 +596,15 @@ class ScanWorker(QtCore.QObject):
     finished = QtCore.pyqtSignal(object)
     failed = QtCore.pyqtSignal(str)
 
-    def __init__(self, config: ResearchConfig, screen_bbox):
+    def __init__(self, region: WorkRegion, screen_bbox):
         super().__init__()
-        self.config = config
+        self.region = region
         self.screen_bbox = screen_bbox
 
     @QtCore.pyqtSlot()
     def run(self):
         try:
-            result = ResearchScanner().capture_and_scan(self.config, self.screen_bbox)
+            result = ResearchScanner().capture_and_scan(self.region, self.screen_bbox)
         except Exception as exc:
             traceback.print_exc()
             self.failed.emit(str(exc))
@@ -513,18 +612,32 @@ class ScanWorker(QtCore.QObject):
         self.finished.emit(result)
 
 
+class CalibrationWorker(QtCore.QObject):
+    finished = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(self, region: WorkRegion, screen_bbox):
+        super().__init__()
+        self.region = region
+        self.screen_bbox = screen_bbox
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        try:
+            layout = ResearchScanner().capture_and_calibrate(self.region, self.screen_bbox)
+        except Exception as exc:
+            traceback.print_exc()
+            self.failed.emit(str(exc))
+            return
+        self.finished.emit(layout)
+
+
 class DragWorker(QtCore.QObject):
     progress = QtCore.pyqtSignal(int, int)
     finished = QtCore.pyqtSignal(bool, str)
     failed = QtCore.pyqtSignal(str)
 
-    def __init__(
-        self,
-        result: ScanResult,
-        stop_event: threading.Event,
-        target_window: int,
-        screen_origin,
-    ):
+    def __init__(self, result: ScanResult, stop_event, target_window, screen_origin):
         super().__init__()
         self.result = result
         self.stop_event = stop_event
@@ -540,15 +653,12 @@ class DragWorker(QtCore.QObject):
         return None
 
     def _move_cursor(self, x: int, y: int) -> Optional[str]:
-        """使用虚拟桌面坐标瞬移鼠标，保持旧版 pydirectinput 的速度。"""
         reason = self._must_stop()
         if reason:
             return reason
-
         if sys.platform != "win32":
             pydirectinput.moveTo(x, y)
             return self._must_stop()
-
         if not ctypes.windll.user32.SetCursorPos(x, y):
             raise RuntimeError("无法移动鼠标到所选屏幕")
         time.sleep(pydirectinput.PAUSE)
@@ -564,18 +674,15 @@ class DragWorker(QtCore.QObject):
                 if reason:
                     self.finished.emit(True, reason)
                     return
-
                 screen_x, screen_y = self.screen_origin
                 source_x = placement.source.center.x() + screen_x
                 source_y = placement.source.center.y() + screen_y
                 target_x = placement.target.center.x() + screen_x
                 target_y = placement.target.center.y() + screen_y
-
                 reason = self._move_cursor(source_x, source_y)
                 if reason:
                     self.finished.emit(True, reason)
                     return
-
                 try:
                     pydirectinput.mouseDown()
                     time.sleep(0.08)
@@ -589,13 +696,11 @@ class DragWorker(QtCore.QObject):
                         return
                 finally:
                     safe_mouse_up()
-
                 reason = self._must_stop()
                 if reason:
                     self.finished.emit(True, reason)
                     return
                 self.progress.emit(index + 1, total)
-
             self.finished.emit(False, "连线完成，请重新扫描下一项研究")
         except Exception as exc:
             traceback.print_exc()
@@ -651,10 +756,10 @@ class ApplicationController(QtCore.QObject):
         self.latest_result: Optional[ScanResult] = None
         self.target_window = 0
         self.config_dialog: Optional[ConfigDialog] = None
-        self.scan_thread = None
-        self.scan_worker = None
-        self.drag_thread = None
-        self.drag_worker = None
+        self.region_selector: Optional[RegionSelector] = None
+        self.scan_thread = self.scan_worker = None
+        self.calibration_thread = self.calibration_worker = None
+        self.drag_thread = self.drag_worker = None
         self.selected_screen = self._load_selected_screen()
         self.overlay.set_screen(self.selected_screen)
         self.panel.set_screen_label(self._screen_short_label(self.selected_screen))
@@ -669,7 +774,6 @@ class ApplicationController(QtCore.QObject):
         self.panel.config_requested.connect(self.open_config)
         self.panel.screen_requested.connect(self.select_screen)
         self.panel.closed.connect(self.shutdown)
-
         self.hotkey_bridge = HotkeyBridge()
         self.hotkey_bridge.scan.connect(self.scan, QtCore.Qt.QueuedConnection)
         self.hotkey_bridge.drag.connect(self.start_drag, QtCore.Qt.QueuedConnection)
@@ -678,13 +782,19 @@ class ApplicationController(QtCore.QObject):
         hotkey_error = self.hotkeys.register(self.scan_hotkey, self.drag_hotkey)
         if hotkey_error:
             self.panel.set_status(f"全局快捷键注册失败：{hotkey_error}\n仍可使用窗口按钮。")
-
         self.foreground_timer = QtCore.QTimer(self)
         self.foreground_timer.timeout.connect(self._remember_foreground_window)
         self.foreground_timer.start(100)
         self.app.screenRemoved.connect(self._screen_removed)
         self.app.aboutToQuit.connect(self._cleanup)
         self.panel.show()
+
+    def _screen_size(self):
+        geometry = self.selected_screen.geometry()
+        return geometry.width(), geometry.height()
+
+    def _load_region(self) -> WorkRegion:
+        return WorkRegion.load(REGION_PATH, self._screen_size())
 
     def _load_selected_screen(self):
         screens = QtGui.QGuiApplication.screens()
@@ -698,22 +808,20 @@ class ApplicationController(QtCore.QObject):
     def _screen_short_label(screen):
         if screen is None:
             return "未检测到"
-        raw_name = screen.name()
-        digits = "".join(character for character in raw_name if character.isdigit())
+        digits = "".join(character for character in screen.name() if character.isdigit())
         if digits:
             return f"屏幕 {digits}"
         screens = QtGui.QGuiApplication.screens()
         try:
             return f"屏幕 {screens.index(screen) + 1}"
         except ValueError:
-            return raw_name or "未知屏幕"
+            return screen.name() or "未知屏幕"
 
     def _screen_menu_label(self, screen):
         geometry = screen.geometry()
-        short_label = self._screen_short_label(screen)
         primary = "（主屏）" if screen == QtGui.QGuiApplication.primaryScreen() else ""
         return (
-            f"{short_label}{primary}  {geometry.width()}×{geometry.height()}  "
+            f"{self._screen_short_label(screen)}{primary}  {geometry.width()}×{geometry.height()}  "
             f"位置 ({geometry.x()}, {geometry.y()})"
         )
 
@@ -722,12 +830,7 @@ class ApplicationController(QtCore.QObject):
         if screen is None:
             raise RuntimeError("没有检测到可用屏幕")
         geometry = screen.geometry()
-        return (
-            geometry.x(),
-            geometry.y(),
-            geometry.x() + geometry.width(),
-            geometry.y() + geometry.height(),
-        )
+        return geometry.x(), geometry.y(), geometry.x() + geometry.width(), geometry.y() + geometry.height()
 
     def _set_selected_screen(self, screen, invalidate_result=True):
         if screen is None:
@@ -740,30 +843,20 @@ class ApplicationController(QtCore.QObject):
         self.overlay.set_screen(screen, clear=changed)
         if changed and invalidate_result:
             self.latest_result = None
-            self._set_state(AppState.IDLE, f"已切换到{self._screen_short_label(screen)}，请重新扫描")
+            self._set_state(AppState.IDLE, f"已切换到{self._screen_short_label(screen)}，请重新选择区域或扫描")
 
     @QtCore.pyqtSlot()
     def select_screen(self):
-        if self.config_dialog is not None or self.state in {
-            AppState.SCANNING,
-            AppState.DRAGGING,
-            AppState.STOPPING,
-        }:
+        if self.config_dialog is not None or self.state in {AppState.SCANNING, AppState.DRAGGING, AppState.STOPPING}:
             return
         menu = QtWidgets.QMenu(self.panel)
         menu.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
         for screen in QtGui.QGuiApplication.screens():
             action = menu.addAction(self._screen_menu_label(screen))
             action.setCheckable(True)
-            action.setChecked(
-                self.selected_screen is not None and screen.name() == self.selected_screen.name()
-            )
-            action.triggered.connect(
-                lambda checked=False, selected=screen: self._set_selected_screen(selected)
-            )
-        position = self.panel.screen_button.mapToGlobal(
-            QtCore.QPoint(0, self.panel.screen_button.height())
-        )
+            action.setChecked(self.selected_screen is not None and screen.name() == self.selected_screen.name())
+            action.triggered.connect(lambda checked=False, selected=screen: self._set_selected_screen(selected))
+        position = self.panel.screen_button.mapToGlobal(QtCore.QPoint(0, self.panel.screen_button.height()))
         menu.exec_(position)
 
     def _screen_removed(self, removed_screen):
@@ -774,6 +867,8 @@ class ApplicationController(QtCore.QObject):
         handles = {int(self.panel.winId()), int(self.overlay.winId())}
         if self.config_dialog is not None:
             handles.add(int(self.config_dialog.winId()))
+        if self.region_selector is not None:
+            handles.add(int(self.region_selector.winId()))
         return handles
 
     @QtCore.pyqtSlot()
@@ -796,38 +891,25 @@ class ApplicationController(QtCore.QObject):
 
     @QtCore.pyqtSlot()
     def scan(self):
-        if self.config_dialog is not None or self.state in {
-            AppState.SCANNING,
-            AppState.DRAGGING,
-            AppState.STOPPING,
-        }:
+        if self.config_dialog is not None or self.state in {AppState.SCANNING, AppState.DRAGGING, AppState.STOPPING}:
             return
         try:
-            config = ResearchConfig.load(CONFIG_PATH)
-        except ConfigError as exc:
+            region = self._load_region()
+            screen_bbox = self._screen_bbox()
+        except (ConfigError, RuntimeError) as exc:
             self._set_state(AppState.ERROR, str(exc))
             return
-
         self.latest_result = None
         self.stop_event.clear()
         self.target_window = self._selected_target_window()
-        self._set_state(
-            AppState.SCANNING,
-            f"正在截取{self._screen_short_label(self.selected_screen)}并计算连接方案……",
-        )
+        self._set_state(AppState.SCANNING, f"正在截取{self._screen_short_label(self.selected_screen)}并自动标定、计算方案……")
         self.overlay.clear_overlay()
         self.panel.hide()
-        try:
-            screen_bbox = self._screen_bbox()
-        except RuntimeError as exc:
-            self.panel.show()
-            self._set_state(AppState.ERROR, str(exc))
-            return
-        QtCore.QTimer.singleShot(150, lambda: self._start_scan_worker(config, screen_bbox))
+        QtCore.QTimer.singleShot(180, lambda: self._start_scan_worker(region, screen_bbox))
 
-    def _start_scan_worker(self, config: ResearchConfig, screen_bbox):
+    def _start_scan_worker(self, region, screen_bbox):
         self.scan_thread = QtCore.QThread(self)
-        self.scan_worker = ScanWorker(config, screen_bbox)
+        self.scan_worker = ScanWorker(region, screen_bbox)
         self.scan_worker.moveToThread(self.scan_thread)
         self.scan_thread.started.connect(self.scan_worker.run)
         self.scan_worker.finished.connect(self._scan_finished)
@@ -844,17 +926,15 @@ class ApplicationController(QtCore.QObject):
         self.latest_result = result
         self.panel.show()
         self.overlay.show_result(result)
-
         if result.missing_aspects:
             names = "、".join(result.aspect_name(aspect_id) for aspect_id in result.missing_aspects)
-            self._set_state(AppState.ERROR, f"扫描完成，但左右列表缺少：{names}")
+            self._set_state(AppState.ERROR, f"扫描完成，但当前元素列表缺少：{names}")
             return
         if not result.placements:
-            message = result.warnings[0] if result.warnings else "当前研究无需放置额外要素"
+            message = result.warnings[0] if result.warnings else "当前研究无需放置额外元素"
             self._set_state(AppState.COMPLETE, message)
             return
-
-        message = f"扫描完成：识别 {result.fixed_count} 个固定要素，需要放置 {len(result.placements)} 个要素"
+        message = f"扫描完成：识别 {result.fixed_count} 个固定元素，需要放置 {len(result.placements)} 个元素"
         if result.warnings:
             message += "\n" + "；".join(result.warnings)
         self._set_state(AppState.READY, message, can_drag=True)
@@ -868,8 +948,7 @@ class ApplicationController(QtCore.QObject):
 
     @QtCore.pyqtSlot()
     def _scan_thread_finished(self):
-        self.scan_worker = None
-        self.scan_thread = None
+        self.scan_worker = self.scan_thread = None
 
     @QtCore.pyqtSlot()
     def start_drag(self):
@@ -878,11 +957,8 @@ class ApplicationController(QtCore.QObject):
         if self.target_window and self._selected_target_window() != self.target_window:
             self._set_state(AppState.READY, "请先切回扫描时的 Minecraft 窗口，再开始连线", can_drag=True)
             return
-
         self.stop_event.clear()
         self._set_state(AppState.DRAGGING, "正在自动连线，按 Esc 可立即停止")
-
-        # 两种窗口均在鼠标动作前隐藏，避免遮挡或接收任何一次点击。
         self.panel.hide()
         self.overlay.clear_overlay()
         QtCore.QTimer.singleShot(100, self._start_drag_worker)
@@ -893,11 +969,7 @@ class ApplicationController(QtCore.QObject):
         if self.target_window and not activate_window(self.target_window):
             self.panel.show()
             self.overlay.show_result(self.latest_result)
-            self._set_state(
-                AppState.READY,
-                "无法切回扫描时的 Minecraft 窗口，请手动切回后重试",
-                can_drag=True,
-            )
+            self._set_state(AppState.READY, "无法切回扫描时的 Minecraft 窗口，请手动切回后重试", can_drag=True)
             return
         self.drag_thread = QtCore.QThread(self)
         geometry = self.selected_screen.geometry()
@@ -932,7 +1004,6 @@ class ApplicationController(QtCore.QObject):
             self._set_state(AppState.STOPPED, "已按 Esc 紧急停止，请重新扫描")
             return
         self.state = AppState.STOPPING
-        # 等工作线程确认停止后再恢复控制窗，避免窗口出现在仍移动的鼠标下方。
 
     @QtCore.pyqtSlot(bool, str)
     def _drag_finished(self, cancelled: bool, message: str):
@@ -955,31 +1026,27 @@ class ApplicationController(QtCore.QObject):
 
     @QtCore.pyqtSlot()
     def _drag_thread_finished(self):
-        self.drag_worker = None
-        self.drag_thread = None
+        self.drag_worker = self.drag_thread = None
 
     @QtCore.pyqtSlot()
     def open_config(self):
-        if self.config_dialog is not None or self.state in {
-            AppState.SCANNING,
-            AppState.DRAGGING,
-            AppState.STOPPING,
-        }:
+        if self.config_dialog is not None or self.state in {AppState.SCANNING, AppState.DRAGGING, AppState.STOPPING}:
             return
         try:
-            config = ResearchConfig.load(CONFIG_PATH)
+            region = self._load_region()
         except ConfigError as exc:
             self._set_state(AppState.ERROR, str(exc))
             return
-
         self.config_dialog = ConfigDialog(
-            config,
-            CONFIG_PATH,
+            region,
+            REGION_PATH,
+            self._screen_size(),
             self.scan_hotkey,
             self.drag_hotkey,
         )
         self.target_window = self._selected_target_window()
-        self.config_dialog.preview_requested.connect(self._preview_config)
+        self.config_dialog.select_region_requested.connect(self._select_work_region)
+        self.config_dialog.calibrate_requested.connect(self._preview_config)
         self.config_dialog.runtime_saved.connect(self._runtime_saved)
         self.config_dialog.config_saved.connect(self._config_saved)
         self.config_dialog.finished.connect(self._config_dialog_closed)
@@ -995,36 +1062,106 @@ class ApplicationController(QtCore.QObject):
             return
         area = self.selected_screen.availableGeometry()
         frame = self.config_dialog.frameGeometry()
-        self.config_dialog.move(
-            area.center().x() - frame.width() // 2,
-            area.center().y() - frame.height() // 2,
-        )
+        self.config_dialog.move(area.center().x() - frame.width() // 2, area.center().y() - frame.height() // 2)
+
+    @QtCore.pyqtSlot()
+    def _select_work_region(self):
+        if self.config_dialog is None or self.region_selector is not None:
+            return
+        try:
+            region = self.config_dialog.build_region()
+        except ConfigError as exc:
+            self.config_dialog.show_calibration_error(str(exc))
+            return
+        self.overlay.clear_overlay()
+        self.panel.hide()
+        self.config_dialog.hide()
+        self.region_selector = RegionSelector(self.selected_screen, region)
+        self.region_selector.selected.connect(self._region_selected)
+        self.region_selector.cancelled.connect(self._region_selection_cancelled)
+        self.region_selector.show()
 
     @QtCore.pyqtSlot(object)
-    def _preview_config(self, config: ResearchConfig):
-        self.overlay.show_calibration(config)
+    def _region_selected(self, region: WorkRegion):
+        if self.region_selector is not None:
+            self.region_selector.close()
+            self.region_selector.deleteLater()
+            self.region_selector = None
+        if self.config_dialog is not None:
+            self.config_dialog.set_region(region)
+            self.config_dialog.show()
+            self.config_dialog.raise_()
+
+    @QtCore.pyqtSlot()
+    def _region_selection_cancelled(self):
+        if self.region_selector is not None:
+            self.region_selector.close()
+            self.region_selector.deleteLater()
+            self.region_selector = None
+        if self.config_dialog is not None:
+            self.config_dialog.show()
+            self.config_dialog.raise_()
 
     @QtCore.pyqtSlot(object)
-    def _config_saved(self, config: ResearchConfig):
+    def _preview_config(self, region: WorkRegion):
+        if self.config_dialog is None or self.calibration_thread is not None:
+            return
+        self.config_dialog.set_busy(True, "正在截取游戏画面并自动标定……")
+        self.overlay.clear_overlay()
+        self.panel.hide()
+        self.config_dialog.hide()
+        screen_bbox = self._screen_bbox()
+        QtCore.QTimer.singleShot(180, lambda: self._start_calibration_worker(region, screen_bbox))
+
+    def _start_calibration_worker(self, region, screen_bbox):
+        self.calibration_thread = QtCore.QThread(self)
+        self.calibration_worker = CalibrationWorker(region, screen_bbox)
+        self.calibration_worker.moveToThread(self.calibration_thread)
+        self.calibration_thread.started.connect(self.calibration_worker.run)
+        self.calibration_worker.finished.connect(lambda layout: self._calibration_finished(layout, region))
+        self.calibration_worker.failed.connect(self._calibration_failed)
+        self.calibration_worker.finished.connect(self.calibration_thread.quit)
+        self.calibration_worker.failed.connect(self.calibration_thread.quit)
+        self.calibration_thread.finished.connect(self.calibration_worker.deleteLater)
+        self.calibration_thread.finished.connect(self.calibration_thread.deleteLater)
+        self.calibration_thread.finished.connect(self._calibration_thread_finished)
+        self.calibration_thread.start()
+
+    def _calibration_finished(self, layout: DetectedLayout, region: WorkRegion):
+        if self.config_dialog is None:
+            return
+        self.config_dialog.show()
+        self.overlay.show_calibration(layout, region)
+        self.config_dialog.show_calibration_status(layout)
+        self.config_dialog.raise_()
+
+    @QtCore.pyqtSlot(str)
+    def _calibration_failed(self, message: str):
+        self.overlay.clear_overlay()
+        if self.config_dialog is not None:
+            self.config_dialog.show()
+            self.config_dialog.show_calibration_error(message)
+            self.config_dialog.raise_()
+
+    @QtCore.pyqtSlot()
+    def _calibration_thread_finished(self):
+        self.calibration_worker = self.calibration_thread = None
+
+    @QtCore.pyqtSlot(object)
+    def _config_saved(self, region: WorkRegion):
         self.latest_result = None
-        self._set_state(AppState.IDLE, "坐标已保存，请扫描研究")
+        self._set_state(AppState.IDLE, "工作区域已保存，请扫描研究")
 
     @QtCore.pyqtSlot(str, str)
     def _runtime_saved(self, scan_hotkey: str, drag_hotkey: str):
-        old_scan_hotkey = self.scan_hotkey
-        old_drag_hotkey = self.drag_hotkey
+        old_scan_hotkey, old_drag_hotkey = self.scan_hotkey, self.drag_hotkey
         self.hotkeys.unregister()
         hotkey_error = self.hotkeys.register(scan_hotkey, drag_hotkey)
         if hotkey_error:
             self.hotkeys.register(old_scan_hotkey, old_drag_hotkey)
-            QtCore.QTimer.singleShot(
-                0,
-                lambda: self._set_state(AppState.ERROR, f"快捷键更新失败：{hotkey_error}"),
-            )
+            QtCore.QTimer.singleShot(0, lambda: self._set_state(AppState.ERROR, f"快捷键更新失败：{hotkey_error}"))
             return
-
-        self.scan_hotkey = scan_hotkey
-        self.drag_hotkey = drag_hotkey
+        self.scan_hotkey, self.drag_hotkey = scan_hotkey, drag_hotkey
         self.panel.settings.setValue("scan_hotkey", scan_hotkey)
         self.panel.settings.setValue("drag_hotkey", drag_hotkey)
         self.panel.set_hotkeys(scan_hotkey, drag_hotkey)
@@ -1035,6 +1172,7 @@ class ApplicationController(QtCore.QObject):
         if self.config_dialog is not None:
             self.config_dialog.deleteLater()
         self.config_dialog = None
+        self.panel.show()
         can_drag = self.state == AppState.READY and self.latest_result is not None
         self.panel.apply_state(self.state, can_drag=can_drag)
 

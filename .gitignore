@@ -27,6 +27,7 @@ Desktop.ini
 # Runtime diagnostics
 *.log
 runtime-test.*
+calibration.json
 
 # Archived local code; history is kept in Git
 old/
